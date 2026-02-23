@@ -1,0 +1,7 @@
+__pycache__
+*.pyc
+*.xlsx
+*.docx
+.git
+.gitignore
+*.md
