@@ -41,11 +41,25 @@ st.markdown("""
     .stTabs [data-baseweb="tab"] {
         padding: 8px 16px;
     }
+    .success-box {
+        background: #d4edda;
+        border: 1px solid #c3e6cb;
+        border-radius: 8px;
+        padding: 1rem;
+        margin: 1rem 0;
+        color: #155724;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="main-header">Sistema de Distribución - Calzado Erez</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-header">Genera propuestas de distribución desde el inventario de almacén</div>', unsafe_allow_html=True)
+
+# --- Inicializar session_state ---
+if 'processed_results' not in st.session_state:
+    st.session_state.processed_results = None
+if 'processed_files' not in st.session_state:
+    st.session_state.processed_files = None
 
 # --- SIDEBAR: Upload + Config ---
 with st.sidebar:
@@ -75,6 +89,11 @@ with st.sidebar:
         st.error("Máximo 2 archivos (DAMA y CABALLERO)")
         uploaded_files = uploaded_files[:2]
 
+    # Detectar si los archivos cambiaron para limpiar resultados previos
+    current_file_names = sorted([f.name for f in uploaded_files]) if uploaded_files else []
+    if current_file_names != st.session_state.processed_files:
+        st.session_state.processed_results = None
+
     process_btn = st.button(
         "Procesar Distribución",
         type="primary",
@@ -82,8 +101,10 @@ with st.sidebar:
         use_container_width=True,
     )
 
-# --- PROCESAMIENTO ---
+# --- SIN ARCHIVOS ---
 if not uploaded_files:
+    st.session_state.processed_results = None
+    st.session_state.processed_files = None
     st.info("Sube un archivo de inventario en el panel izquierdo para comenzar.")
     st.markdown("""
     ### Instrucciones
@@ -96,59 +117,94 @@ if not uploaded_files:
     """)
     st.stop()
 
-# Mostrar archivos subidos
-if uploaded_files and not process_btn:
-    st.subheader("Archivos cargados")
-    for f in uploaded_files:
-        st.write(f"- **{f.name}** ({f.size / 1024:.0f} KB)")
-    st.info("Haz clic en **Procesar Distribución** para generar la propuesta.")
-    st.stop()
-
+# --- PROCESAMIENTO (solo cuando se presiona el botón) ---
 if process_btn:
-    results = []
+    all_results = []
 
     for file_idx, uploaded_file in enumerate(uploaded_files):
         file_label = f"Archivo {file_idx + 1}: {uploaded_file.name}"
-        st.subheader(file_label)
 
-        progress_bar = st.progress(0, text="Iniciando...")
+        with st.spinner(f"Procesando {uploaded_file.name}..."):
+            st.subheader(file_label)
+            progress_bar = st.progress(0, text="Iniciando carga del inventario...")
 
-        def update_progress(pct, msg):
-            progress_bar.progress(min(pct, 1.0), text=msg)
+            def update_progress(pct, msg):
+                progress_bar.progress(min(pct, 1.0), text=msg)
 
-        # Paso 1: Cargar
-        try:
-            data = load_inventory(uploaded_file, progress_callback=update_progress)
-        except Exception as e:
-            st.error(f"Error al cargar archivo: {e}")
-            continue
+            # Paso 1: Cargar
+            try:
+                data = load_inventory(uploaded_file, progress_callback=update_progress)
+            except Exception as e:
+                st.error(f"Error al cargar archivo: {e}")
+                continue
 
-        linea = data['linea']
-        tallas = data['tallas']
-        n_records = data['total_rows']
+            linea = data['linea']
+            tallas = data['tallas']
+            n_records = data['total_rows']
 
-        # Mostrar detección
+            if not tallas:
+                st.error("No se detectaron tallas válidas en el archivo.")
+                progress_bar.empty()
+                continue
+
+            # Paso 2: Distribuir
+            try:
+                result = run_distribution(data['records'], tallas, progress_callback=update_progress)
+            except Exception as e:
+                st.error(f"Error en distribución: {e}")
+                continue
+
+            progress_bar.progress(1.0, text="¡Distribución completa!")
+
+            # Paso 3: Generar archivos
+            progress_bar.progress(1.0, text="Generando archivos de descarga...")
+            excel_bytes = generate_excel(result, linea, fecha_str, tallas)
+            word_bytes = generate_word(result, linea, fecha_str, tallas)
+
+            nombre_excel = f"DISTRIBUCION_{linea}_{fecha_dist.strftime('%d%b%Y').upper()}.xlsx"
+            nombre_word = f"OBSERVACIONES_{linea}_{fecha_dist.strftime('%d%b%Y').upper()}.docx"
+
+            progress_bar.progress(1.0, text="¡Proceso terminado!")
+
+            all_results.append({
+                'linea': linea,
+                'tallas': tallas,
+                'n_records': n_records,
+                'result': result,
+                'summary': result['summary'],
+                'excel_bytes': excel_bytes,
+                'word_bytes': word_bytes,
+                'nombre_excel': nombre_excel,
+                'nombre_word': nombre_word,
+                'file_name': uploaded_file.name,
+            })
+
+    # Guardar en session_state para persistir entre reruns
+    if all_results:
+        st.session_state.processed_results = all_results
+        st.session_state.processed_files = current_file_names
+        st.rerun()
+
+# --- MOSTRAR RESULTADOS (desde session_state) ---
+if st.session_state.processed_results:
+    all_results = st.session_state.processed_results
+
+    st.markdown('<div class="success-box">&#9989; <strong>Distribución procesada exitosamente.</strong> Los archivos están listos para descarga.</div>', unsafe_allow_html=True)
+
+    for file_idx, res in enumerate(all_results):
+        linea = res['linea']
+        tallas = res['tallas']
+        result = res['result']
+        summary = res['summary']
+        resumen_tienda = summary['resumen_tienda']
+
+        st.subheader(f"{linea} — {res['file_name']}")
+
+        # Detección
         col1, col2, col3 = st.columns(3)
         col1.metric("Línea detectada", linea)
-        col2.metric("Registros", f"{n_records:,}")
+        col2.metric("Registros", f"{res['n_records']:,}")
         col3.metric("Tallas", " - ".join(str(t) for t in tallas))
-
-        if not tallas:
-            st.error("No se detectaron tallas válidas en el archivo.")
-            progress_bar.empty()
-            continue
-
-        # Paso 2: Distribuir
-        try:
-            result = run_distribution(data['records'], tallas, progress_callback=update_progress)
-        except Exception as e:
-            st.error(f"Error en distribución: {e}")
-            continue
-
-        progress_bar.progress(1.0, text="Distribución completa")
-
-        summary = result['summary']
-        resumen_tienda = summary['resumen_tienda']
 
         # --- MÉTRICAS PRINCIPALES ---
         st.divider()
@@ -158,13 +214,37 @@ if process_btn:
         m3.metric("% Almacén", f"{summary['pct_distribuido']:.0f}%")
         m4.metric("Valor", f"${summary['total_valor']:,.0f}")
 
+        # --- DESCARGAS (arriba, bien visibles) ---
+        st.divider()
+        st.subheader("Descargar Resultados")
+        dl1, dl2 = st.columns(2)
+
+        with dl1:
+            st.download_button(
+                label=f"📊 Descargar Excel - {linea}",
+                data=res['excel_bytes'],
+                file_name=res['nombre_excel'],
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key=f"dl_excel_{file_idx}",
+            )
+
+        with dl2:
+            st.download_button(
+                label=f"📝 Descargar Word - {linea}",
+                data=res['word_bytes'],
+                file_name=res['nombre_word'],
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True,
+                key=f"dl_word_{file_idx}",
+            )
+
         # --- TABS: Detalle ---
         tab_resumen, tab_prioridad, tab_tiendas = st.tabs(
             ["Resumen por Tienda", "Por Prioridad", "Detalle Tiendas"]
         )
 
         with tab_resumen:
-            # Tabla resumen
             rows_data = []
             for t in sorted(resumen_tienda.keys()):
                 r = resumen_tienda[t]
@@ -215,7 +295,6 @@ if process_btn:
             if tienda_sel:
                 items_tienda = [d for d in result['distribuciones'] if d['TIENDA'] == tienda_sel]
                 if items_tienda:
-                    # Agrupar por producto
                     from collections import defaultdict
                     prods = defaultdict(lambda: defaultdict(int))
                     prod_meta = {}
@@ -235,44 +314,20 @@ if process_btn:
 
                     st.dataframe(detail_rows, use_container_width=True, hide_index=True)
 
-        # --- DESCARGAS ---
-        st.divider()
-        st.subheader("Descargar Resultados")
-
-        dl1, dl2 = st.columns(2)
-
-        with dl1:
-            excel_bytes = generate_excel(result, linea, fecha_str, tallas)
-            nombre_excel = f"DISTRIBUCION_{linea}_{fecha_dist.strftime('%d%b%Y').upper()}.xlsx"
-            st.download_button(
-                label=f"Descargar Excel - {linea}",
-                data=excel_bytes,
-                file_name=nombre_excel,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                key=f"dl_excel_{file_idx}",
-            )
-
-        with dl2:
-            word_bytes = generate_word(result, linea, fecha_str, tallas)
-            nombre_word = f"OBSERVACIONES_{linea}_{fecha_dist.strftime('%d%b%Y').upper()}.docx"
-            st.download_button(
-                label=f"Descargar Word - {linea}",
-                data=word_bytes,
-                file_name=nombre_word,
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                use_container_width=True,
-                key=f"dl_word_{file_idx}",
-            )
-
-        results.append({'linea': linea, 'summary': summary})
         st.divider()
 
     # Resumen final si hay múltiples archivos
-    if len(results) > 1:
+    if len(all_results) > 1:
         st.subheader("Resumen General")
-        total_general = sum(r['summary']['total_pares'] for r in results)
-        valor_general = sum(r['summary']['total_valor'] for r in results)
+        total_general = sum(r['summary']['total_pares'] for r in all_results)
+        valor_general = sum(r['summary']['total_valor'] for r in all_results)
         g1, g2 = st.columns(2)
         g1.metric("Total Pares (ambas líneas)", f"{total_general:,}")
         g2.metric("Valor Total", f"${valor_general:,.0f}")
+
+elif uploaded_files and not process_btn:
+    # Archivos cargados pero aún no se ha procesado
+    st.subheader("Archivos cargados")
+    for f in uploaded_files:
+        st.write(f"- **{f.name}** ({f.size / 1024:.0f} KB)")
+    st.info("Haz clic en **Procesar Distribución** para generar la propuesta.")
