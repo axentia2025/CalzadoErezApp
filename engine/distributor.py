@@ -1,6 +1,7 @@
 """
-Algoritmo de distribución v2 - Calzado Erez.
-Lógica validada: F1=0.95 Tienda 12, 93% precisión volumen total.
+Algoritmo de distribución v3 - Calzado Erez.
+Distribución pareja: reparte a TODAS las tiendas con cantidades equilibradas.
+Solo salta tienda+talla si tiene inventario y cero ventas en 15 días.
 """
 from collections import defaultdict
 
@@ -144,12 +145,22 @@ def calculate_needs(almacen_por_producto, tiendas_info, tiendas_ordenadas, talla
 
 
 def distribute_stock(almacen_por_producto, necesidades, tallas, tiendas_info, tiendas_ordenadas):
-    """Distribuye stock del almacén a tiendas.
+    """Distribuye stock del almacén a tiendas con distribución pareja.
+
+    Estrategia:
+    - Para cada talla, reparte el stock de forma equitativa entre TODAS las tiendas elegibles.
+    - Solo salta tienda+talla si la tienda tiene inventario > 0 Y cero ventas en 15 días.
+    - Si repartir solo entre elegibles daría más de SPREAD_THRESHOLD por tienda,
+      incluye también las tiendas saltadas para distribuir más ampliamente.
+    - Las tiendas con mayor demanda reciben primero los pares de residuo (+1).
+    - Objetivo: distribuir TODO el inventario.
 
     Returns:
         distribuciones: lista de dicts con cada asignación talla-tienda
         resumen_producto: {prod_key: {inv_original, distribuido, restante}}
     """
+    SPREAD_THRESHOLD = 5  # Si por tienda superaría esto, expandir a más tiendas
+
     stock_disponible = {}
     for prod_key, prod_info in almacen_por_producto.items():
         stock_disponible[prod_key] = dict(prod_info['tallas'])
@@ -165,94 +176,86 @@ def distribute_stock(almacen_por_producto, necesidades, tallas, tiendas_info, ti
             continue
 
         stock = stock_disponible[prod_key]
-        stock_total_restante = sum(stock.values())
-        if stock_total_restante == 0:
-            continue
-
-        total_score = sum(n['score'] for n in tiendas_necesidad)
-        if total_score == 0:
+        if sum(stock.values()) == 0:
             continue
 
         distribuido_producto = 0
 
-        # Primera pasada: asignación ideal
-        asignaciones_ideales = []
-        for necesidad in tiendas_necesidad:
-            proporcion = necesidad['score'] / total_score
-            qty_ideal = prod_info['total_inv'] * proporcion
-            asignaciones_ideales.append((necesidad, proporcion, qty_ideal))
-
-        # Segunda pasada: asignar respetando stock
-        for necesidad, proporcion, qty_ideal in asignaciones_ideales:
-            tienda = necesidad['tienda']
-
-            stock_total_restante = sum(stock.values())
-            if stock_total_restante <= 0:
-                break
-
-            tallas_detalle = necesidad['tallas_detalle']
-            total_vtas_talla = sum(tallas_detalle[t]['vtas_15'] for t in tallas)
-
-            # Curva de tallas
-            if total_vtas_talla > 0:
-                curva_tallas = {}
-                for t in tallas:
-                    curva_tallas[t] = tallas_detalle[t]['vtas_15'] / total_vtas_talla
-            else:
-                total_vtas_global = sum(
-                    tiendas_info[ti].get(prod_key, {}).get(t, {'vtas_15': 0})['vtas_15']
-                    for ti in tiendas_ordenadas for t in tallas
-                )
-                if total_vtas_global > 0:
-                    curva_tallas = {}
-                    for t in tallas:
-                        vtas_t = sum(
-                            tiendas_info[ti].get(prod_key, {}).get(t, {'vtas_15': 0})['vtas_15']
-                            for ti in tiendas_ordenadas
-                        )
-                        curva_tallas[t] = vtas_t / total_vtas_global
-                else:
-                    curva_tallas = {t: 1.0 / len(tallas) for t in tallas}
-
-            asignaciones_talla = {}
-            for t in tallas:
-                qty_talla = round(qty_ideal * curva_tallas[t])
-                qty_talla = min(qty_talla, stock.get(t, 0))
-                if qty_talla > 0:
-                    asignaciones_talla[t] = qty_talla
-
-            # Mínimo 1 par para urgentes/altas
-            if not asignaciones_talla and necesidad['prioridad'] in ['URGENTE', 'ALTA']:
-                mejor_talla = max(tallas, key=lambda t: curva_tallas.get(t, 0))
-                if stock.get(mejor_talla, 0) > 0:
-                    asignaciones_talla[mejor_talla] = 1
-
-            if not asignaciones_talla:
+        for talla in tallas:
+            stock_talla = stock.get(talla, 0)
+            if stock_talla <= 0:
                 continue
 
-            total_asignado = 0
-            for t, qty in asignaciones_talla.items():
-                stock[t] = stock.get(t, 0) - qty
-                total_asignado += qty
+            # Clasificar tiendas en preferidas (elegibles) y saltables
+            preferred = []   # Sin stock, o tiene stock con ventas
+            skippable = []   # Tiene stock Y cero ventas en 15 días
 
+            for nec in tiendas_necesidad:
+                td = nec['tallas_detalle'].get(talla, {'inven': 0, 'vtas_15': 0})
+                if td['inven'] > 0 and td['vtas_15'] == 0:
+                    skippable.append(nec)
+                else:
+                    preferred.append(nec)
+
+            # Ordenar por score (mayor demanda primero para el residuo)
+            preferred.sort(key=lambda x: -x['score'])
+            skippable.sort(key=lambda x: -x['score'])
+
+            # Pool de distribución: empezar con preferidas
+            pool = preferred
+
+            # Si distribuir solo a preferidas daría demasiado por tienda,
+            # expandir incluyendo las saltables
+            if pool and stock_talla / len(pool) > SPREAD_THRESHOLD:
+                pool = preferred + skippable
+                pool.sort(key=lambda x: -x['score'])
+
+            # Si no hay preferidas, usar todas las tiendas
+            if not pool:
+                pool = preferred + skippable
+                pool.sort(key=lambda x: -x['score'])
+
+            if not pool:
+                continue
+
+            # Distribución equitativa
+            n = len(pool)
+            base = stock_talla // n
+            remainder = stock_talla % n
+
+            # Si base es 0, solo 'remainder' tiendas reciben 1 par cada una
+            # Si base > 0, todas reciben 'base' y las primeras 'remainder' reciben base+1
+            assigned_total = 0
+            for i, nec in enumerate(pool):
+                qty = base + (1 if i < remainder else 0)
+                if qty <= 0:
+                    continue
+
+                # No exceder el stock restante
+                qty = min(qty, stock_talla - assigned_total)
+                if qty <= 0:
+                    break
+
+                td = nec['tallas_detalle'].get(talla, {'inven': 0, 'vtas_15': 0})
+
+                assigned_total += qty
                 distribuciones.append({
-                    'TIENDA': tienda,
+                    'TIENDA': nec['tienda'],
                     'SUBLINEA': prod_info['sublinea'],
                     'MARCA': marca,
                     'MODELO': modelo,
                     'COLOR': color,
-                    'TALLA': t,
+                    'TALLA': talla,
                     'QTY_ENVIAR': qty,
                     'PRECIO': prod_info['precio'],
-                    'PRIORIDAD': necesidad['prioridad'],
-                    'INV_ALMACEN': prod_info['tallas'].get(t, 0),
-                    'INV_TIENDA': tallas_detalle[t]['inven'],
-                    'VTAS_15D': tallas_detalle[t]['vtas_15'],
+                    'PRIORIDAD': nec['prioridad'],
+                    'INV_ALMACEN': prod_info['tallas'].get(talla, 0),
+                    'INV_TIENDA': td['inven'],
+                    'VTAS_15D': td['vtas_15'],
                 })
 
-            distribuido_producto += total_asignado
-            if sum(stock.values()) <= 0:
-                break
+            stock[talla] -= assigned_total
+            distribuido_producto += assigned_total
 
         resumen_producto[prod_key] = {
             'inv_original': prod_info['total_inv'],
