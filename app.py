@@ -8,6 +8,8 @@ from engine.loader import load_inventory
 from engine.distributor import run_distribution
 from engine.excel_writer import generate_excel
 from engine.word_writer import generate_word
+from engine.rules import RuleStore
+from engine.claude_interpreter import interpret_instruction
 
 st.set_page_config(
     page_title="Distribución - Calzado Erez",
@@ -55,11 +57,17 @@ st.markdown("""
 st.markdown('<div class="main-header">Sistema de Distribución - Calzado Erez</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-header">Genera propuestas de distribución desde el inventario de almacén</div>', unsafe_allow_html=True)
 
-# --- Inicializar session_state ---
+# --- Inicializar RuleStore y session_state ---
+rule_store = RuleStore()
+
 if 'processed_results' not in st.session_state:
     st.session_state.processed_results = None
 if 'processed_files' not in st.session_state:
     st.session_state.processed_files = None
+if 'rule_error' not in st.session_state:
+    st.session_state.rule_error = None
+if 'rule_success' not in st.session_state:
+    st.session_state.rule_success = None
 
 # --- SIDEBAR: Upload + Config ---
 with st.sidebar:
@@ -100,6 +108,72 @@ with st.sidebar:
         disabled=not uploaded_files,
         use_container_width=True,
     )
+
+    # --- INSTRUCCIONES DEL CLIENTE ---
+    st.divider()
+    st.header("📋 Instrucciones")
+    st.caption(
+        "Escribe instrucciones en español para personalizar la distribución. "
+        "Ejemplo: \"A la tienda 33 no mandarle sandalias\""
+    )
+
+    nueva_instruccion = st.text_area(
+        "Nueva instrucción",
+        placeholder="Ej: No mandar talla 29 a tienda 5, priorizar tienda 12 para botas...",
+        height=80,
+        key="nueva_instruccion",
+    )
+
+    agregar_btn = st.button(
+        "➕ Agregar Instrucción",
+        disabled=not nueva_instruccion,
+        use_container_width=True,
+    )
+
+    if agregar_btn and nueva_instruccion:
+        with st.spinner("Interpretando instrucción con IA..."):
+            try:
+                reglas_nuevas = interpret_instruction(nueva_instruccion)
+                for regla in reglas_nuevas:
+                    regla["original_instruction"] = nueva_instruccion
+                    rule_store.add_rule(regla)
+                st.session_state.rule_success = f"✅ {len(reglas_nuevas)} regla(s) agregada(s)"
+                st.session_state.rule_error = None
+                # Limpiar resultados previos para forzar re-procesamiento
+                st.session_state.processed_results = None
+                st.rerun()
+            except ValueError as e:
+                st.session_state.rule_error = str(e)
+                st.session_state.rule_success = None
+            except Exception as e:
+                st.session_state.rule_error = f"Error al interpretar: {e}"
+                st.session_state.rule_success = None
+
+    # Mostrar mensajes de estado
+    if st.session_state.rule_success:
+        st.success(st.session_state.rule_success)
+        st.session_state.rule_success = None
+    if st.session_state.rule_error:
+        st.error(st.session_state.rule_error)
+        st.session_state.rule_error = None
+
+    # Mostrar reglas activas
+    reglas_activas = rule_store.get_active_rules()
+    if reglas_activas:
+        st.markdown(f"**Reglas activas ({len(reglas_activas)}):**")
+        for regla in reglas_activas:
+            col_desc, col_del = st.columns([5, 1])
+            with col_desc:
+                desc = regla.get("description_es", regla.get("note", "Regla sin descripción"))
+                tipo = regla.get("type", "").replace("_", " ").title()
+                st.markdown(f"• {desc}")
+            with col_del:
+                if st.button("✕", key=f"del_{regla['id']}", help="Eliminar regla"):
+                    rule_store.delete_rule(regla["id"])
+                    st.session_state.processed_results = None
+                    st.rerun()
+    else:
+        st.info("No hay instrucciones activas. La distribución usará criterios estándar.")
 
 # --- SIN ARCHIVOS ---
 if not uploaded_files:
@@ -149,7 +223,12 @@ if process_btn:
 
             # Paso 2: Distribuir
             try:
-                result = run_distribution(data['records'], tallas, progress_callback=update_progress)
+                reglas_activas = rule_store.get_active_rules()
+                result = run_distribution(
+                    data['records'], tallas,
+                    progress_callback=update_progress,
+                    rules=reglas_activas
+                )
             except Exception as e:
                 st.error(f"Error en distribución: {e}")
                 continue
@@ -177,6 +256,7 @@ if process_btn:
                 'nombre_excel': nombre_excel,
                 'nombre_word': nombre_word,
                 'file_name': uploaded_file.name,
+                'rules_applied': result.get('rules_applied', 0),
             })
 
     # Guardar en session_state para persistir entre reruns
@@ -190,6 +270,11 @@ if st.session_state.processed_results:
     all_results = st.session_state.processed_results
 
     st.markdown('<div class="success-box">&#9989; <strong>Distribución procesada exitosamente.</strong> Los archivos están listos para descarga.</div>', unsafe_allow_html=True)
+
+    # Mostrar info de reglas aplicadas
+    if all_results and all_results[0].get('rules_applied', 0) > 0:
+        n_rules = all_results[0]['rules_applied']
+        st.info(f"📋 Se aplicaron **{n_rules} regla(s)** de instrucciones personalizadas en esta distribución.")
 
     for file_idx, res in enumerate(all_results):
         linea = res['linea']

@@ -144,7 +144,8 @@ def calculate_needs(almacen_por_producto, tiendas_info, tiendas_ordenadas, talla
     return necesidades, tienda_vtas_totales
 
 
-def distribute_stock(almacen_por_producto, necesidades, tallas, tiendas_info, tiendas_ordenadas):
+def distribute_stock(almacen_por_producto, necesidades, tallas, tiendas_info,
+                     tiendas_ordenadas, rules=None, product_order=None):
     """Distribuye stock del almacén a tiendas con distribución pareja.
 
     Estrategia:
@@ -155,11 +156,17 @@ def distribute_stock(almacen_por_producto, necesidades, tallas, tiendas_info, ti
     - Las tiendas con mayor demanda reciben primero los pares de residuo (+1).
     - Objetivo: distribuir TODO el inventario.
 
+    Args:
+        rules: lista de reglas (opcional). Aplica max_per_size y max_total_store.
+        product_order: lista ordenada de prod_keys (opcional). Controla orden de procesamiento.
+
     Returns:
         distribuciones: lista de dicts con cada asignación talla-tienda
         resumen_producto: {prod_key: {inv_original, distribuido, restante}}
     """
     SPREAD_THRESHOLD = 5  # Si por tienda superaría esto, expandir a más tiendas
+    if rules is None:
+        rules = []
 
     stock_disponible = {}
     for prod_key, prod_info in almacen_por_producto.items():
@@ -167,8 +174,15 @@ def distribute_stock(almacen_por_producto, necesidades, tallas, tiendas_info, ti
 
     distribuciones = []
     resumen_producto = {}
+    store_running_totals = defaultdict(int)  # Para max_total_store
 
-    for prod_key, tiendas_necesidad in necesidades.items():
+    # Usar orden personalizado si se proporcionó
+    iteration_keys = product_order if product_order else list(necesidades.keys())
+
+    for prod_key in iteration_keys:
+        if prod_key not in necesidades:
+            continue
+        tiendas_necesidad = necesidades[prod_key]
         prod_info = almacen_por_producto[prod_key]
         marca, modelo, color = prod_key
 
@@ -236,9 +250,20 @@ def distribute_stock(almacen_por_producto, necesidades, tallas, tiendas_info, ti
                 if qty <= 0:
                     break
 
+                # Aplicar reglas de distribución (max_per_size, max_total_store)
+                if rules:
+                    from .rules import apply_distribution_rules
+                    qty = apply_distribution_rules(
+                        rules, nec['tienda'], talla, qty, prod_key,
+                        almacen_por_producto, store_running_totals
+                    )
+                    if qty <= 0:
+                        continue
+
                 td = nec['tallas_detalle'].get(talla, {'inven': 0, 'vtas_15': 0})
 
                 assigned_total += qty
+                store_running_totals[nec['tienda']] += qty
                 distribuciones.append({
                     'TIENDA': nec['tienda'],
                     'SUBLINEA': prod_info['sublinea'],
@@ -317,29 +342,57 @@ def build_summary(distribuciones, resumen_producto, almacen_por_producto):
     }
 
 
-def run_distribution(records, tallas, progress_callback=None):
+def run_distribution(records, tallas, progress_callback=None, rules=None):
     """Ejecuta el flujo completo de distribución.
+
+    Args:
+        rules: lista de reglas personalizadas (opcional).
 
     Returns:
         dict con: distribuciones, resumen_producto, summary, almacen_por_producto,
-                  tiendas_info, tiendas_ordenadas
+                  tiendas_info, tiendas_ordenadas, rules_applied
     """
+    if rules is None:
+        rules = []
+
     if progress_callback:
         progress_callback(0.80, "Separando almacén y tiendas...")
 
     almacen, tiendas_info, tiendas_ord = separate_warehouse(records)
+
+    # Fase 1: Pre-filter rules (excluir tiendas/productos/tallas)
+    if rules:
+        from .rules import apply_pre_filter_rules
+        tiendas_ord = apply_pre_filter_rules(rules, almacen, tiendas_info, tiendas_ord)
 
     if progress_callback:
         progress_callback(0.85, "Calculando necesidades...")
 
     necesidades, tienda_vtas = calculate_needs(almacen, tiendas_info, tiendas_ord, tallas)
 
+    # Fase 2: Scoring rules (priorizar/depriorizar)
+    if rules:
+        from .rules import apply_scoring_rules
+        apply_scoring_rules(rules, necesidades, almacen)
+
+    # Fase 3: Ordering rules (reordenar productos)
+    product_order = None
+    if rules:
+        from .rules import apply_ordering_rules
+        product_order = apply_ordering_rules(rules, necesidades, almacen)
+
     if progress_callback:
         progress_callback(0.90, "Distribuyendo stock...")
 
     distribuciones, resumen_prod = distribute_stock(
-        almacen, necesidades, tallas, tiendas_info, tiendas_ord
+        almacen, necesidades, tallas, tiendas_info, tiendas_ord,
+        rules=rules, product_order=product_order
     )
+
+    # Fase 5: Post-filter (safety net)
+    if rules:
+        from .rules import apply_post_filter_rules
+        distribuciones = apply_post_filter_rules(rules, distribuciones)
 
     if progress_callback:
         progress_callback(0.95, "Generando resumen...")
@@ -353,4 +406,5 @@ def run_distribution(records, tallas, progress_callback=None):
         'almacen_por_producto': almacen,
         'tiendas_info': tiendas_info,
         'tiendas_ordenadas': tiendas_ord,
+        'rules_applied': len(rules),
     }
